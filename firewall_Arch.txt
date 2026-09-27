@@ -1,0 +1,377 @@
+===============================================================================
+               FIREWALL EN ARCH LINUX (BlackArch) PARA HACK THE BOX
+                     Reporte paso a paso - 26 de septiembre de 2026
+===============================================================================
+
+Resumen de lo que aprendimos y configuramos: que es un firewall, como funciona
+en Linux, por que importa en HTB y como deje configurado nftables en mi Arch.
+
+-------------------------------------------------------------------------------
+INDICE
+-------------------------------------------------------------------------------
+  1. Que es un firewall
+  2. Conceptos clave
+  3. Firewalls en Linux (netfilter, nftables, iptables, ufw)
+  4. Por que importa en Hack The Box
+  5. Estado inicial de mi sistema
+  6. Revisar si la VPN de HTB esta abierta o cerrada
+  7. Que sigue funcionando y que no con el firewall
+  8. Configuracion final (/etc/nftables.conf)
+  9. Paso a paso: como la aplique
+ 10. Verificacion (y por que systemctl dice "inactive")
+ 11. Como leer la salida de "nft list ruleset"
+ 12. Comandos utiles
+ 13. Si algo falla
+ 14. Otras medidas de seguridad
+ 15. Donde seguir aprendiendo
+
+
+===============================================================================
+1. QUE ES UN FIREWALL
+===============================================================================
+
+Es un filtro que decide que trafico de red ENTRA, SALE o PASA por la maquina,
+segun reglas. Cada paquete se compara con las reglas en orden y se le aplica
+una accion:
+
+  accept  -> deja pasar el paquete
+  drop    -> lo descarta sin responder (el otro lado no sabe si existes)
+  reject  -> lo rechaza y avisa al otro lado ("puerto cerrado")
+
+Analogia: la computadora es una casa y el firewall es el portero que decide
+quien entra.
+
+
+===============================================================================
+2. CONCEPTOS CLAVE
+===============================================================================
+
+* Politica por defecto (policy): lo que pasa si ninguna regla coincide.
+  Lo mas seguro es DENEGAR todo lo que entra y permitir solo lo necesario.
+
+* Cadenas (chains):
+    input   -> trafico que LLEGA a mi maquina (el mas importante)
+    output  -> trafico que SALE de mi maquina
+    forward -> trafico que ATRAVIESA mi maquina hacia otra (como un router)
+
+* Stateful (con estado): el firewall recuerda las conexiones. Si yo abro una
+  conexion hacia afuera, la respuesta se deja entrar sola
+  (ct state established,related). Por eso puedo navegar aunque "input"
+  este bloqueado.
+
+* Interfaces:
+    lo      -> loopback, mi propia maquina (siempre hay que permitirlo)
+    enp8s0  -> mi cable de red (IP 192.168.1.20)
+    wlp9s0  -> wifi
+    tun0    -> la VPN de HTB (solo existe cuando estoy conectado)
+
+* Protocolos: TCP (web, SSH, shells), UDP (DNS, VPN), ICMP (ping).
+
+
+===============================================================================
+3. FIREWALLS EN LINUX
+===============================================================================
+
+Todos usan NETFILTER, que esta dentro del kernel. Netfilter es "la puerta"
+real: siempre esta ahi. Lo que cambia es la herramienta con la que se le dan
+ordenes:
+
+  - nftables (comando nft): la forma moderna y estandar en Arch.
+    ES LA QUE USO.
+  - iptables: la forma antigua. Sale en tutoriales viejos y dentro de
+    maquinas de HTB.
+  - ufw / firewalld: versiones "faciles" que por dentro usan nftables o
+    iptables.
+
+IMPORTANTE: usar solo UNA. Si se mezclan, las reglas se pisan entre si.
+En mi sistema tengo iptables "legacy" instalado; no lo uso. Si un tutorial
+dice "iptables -A ...", esas reglas irian por otro lado y confunden.
+Me quedo con nft.
+
+
+===============================================================================
+4. POR QUE IMPORTA EN HACK THE BOX
+===============================================================================
+
+1. La VPN me mete en una red compartida. En los labs hay otros jugadores en la
+   misma red que pueden escanearme o atacarme.
+2. Necesito dejar entrar ALGUNAS conexiones: reverse shells (nc -lvnp 4444) y
+   servidores para pasar archivos (python -m http.server 8000) reciben
+   conexiones desde la maquina victima.
+3. La solucion: abrir SOLO por tun0 y SOLO desde las IPs de las maquinas
+   objetivo. Nunca en la red de la casa.
+4. Rangos de HTB:
+     Maquinas objetivo: 10.10.10.0/24, 10.10.11.0/24, 10.129.0.0/16
+     Jugadores (yo y los demas): 10.10.14.x y 10.10.16.x  -> quedan BLOQUEADOS
+   (Revisar el panel de HTB por si cambian.)
+
+
+===============================================================================
+5. ESTADO INICIAL DE MI SISTEMA
+===============================================================================
+
+Antes de empezar:
+  - nftables 1.1.7 ya estaba instalado (no hubo que instalar nada).
+  - iptables tambien estaba instalado, pero ningun firewall estaba activo.
+  - El servicio nftables estaba "disabled" / "inactive": no filtraba nada.
+  - /etc/nftables.conf ya existia (el que trae Arch por defecto).
+  - Casi no habia servicios escuchando. Solo Firefox con un puerto UDP.
+
+El archivo por defecto de Arch ya bloqueaba casi todo, pero tenia:
+  - "tcp dport ssh accept" -> abre el puerto 22 (SSH). Lo quite porque no
+    uso SSH para entrar a esta maquina (ni tengo servidor SSH corriendo).
+  - Faltaba la regla para tun0 (HTB), asi que las reverse shells no
+    habrian funcionado.
+
+Sobre SSH: es un protocolo para controlar una maquina a distancia por
+terminal. Si el puerto 22 esta abierto y no lo uso, solo es una puerta mas
+para que alguien intente entrar. Por eso se cierra.
+
+Sobre el puerto de Firefox (udp 0.0.0.0:xxxxx, estado UNCONN): NO es un
+servicio abierto. Es un socket de Firefox para QUIC/HTTP3 o WebRTC. El puerto
+es aleatorio y desaparece al cerrar Firefox. No es peligroso.
+
+
+===============================================================================
+6. REVISAR SI LA VPN DE HTB ESTA ABIERTA O CERRADA
+===============================================================================
+
+La VPN esta CERRADA si:
+  - No existe la interfaz tun0          ->  ip a show tun0
+  - No hay proceso openvpn corriendo    ->  pgrep -a openvpn
+  - No hay rutas a 10.10.x.x / 10.129.x.x ->  ip route
+
+Cuando esta conectada, aparece tun0 con una IP 10.10.x.x.
+
+Tambien hice un "nmap -sn" (ping scan: solo descubre equipos encendidos, no
+escanea puertos) de mi red de casa. Salieron el router, una Smart TV, un
+celular (MAC aleatoria), un repetidor del proveedor y mi PC. Nada raro.
+
+
+===============================================================================
+7. QUE SIGUE FUNCIONANDO Y QUE NO CON EL FIREWALL
+===============================================================================
+
+La configuracion BLOQUEA lo que entra sin que yo lo pida, pero DEJA SALIR
+todo y deja entrar las respuestas.
+
+SIGUE FUNCIONANDO NORMAL:
+  - Instalar cosas: pacman, pip, git clone, AUR, descargas.
+  - Navegar, YouTube, Discord.
+  - Conectarse a la VPN de HTB.
+  - Atacar/escanear hacia afuera: nmap, gobuster, ffuf, sqlmap, hydra,
+    Burp Suite, ssh a la victima, Metasploit en modo bind.
+    (Detalle: nmap -O puede salir un poco menos preciso. Es raro.)
+
+NO FUNCIONARIA SIN LA REGLA DE HTB (la victima se conecta a mi):
+  - Reverse shells: nc -lvnp, multi/handler, penelope, pwncat.
+  - Servir archivos: python -m http.server, impacket-smbserver (445).
+  - Responder / ntlmrelayx.
+  - Pivoting: servidor de chisel o ligolo-ng.
+  - Callbacks: XSS que manda cookies, SSRF, exfiltracion.
+  -> Por eso la regla de tun0 deja entrar TODO lo que venga de las maquinas
+     objetivo de HTB, en cualquier puerto.
+
+COSAS DE CASA QUE PODRIAN FALLAR:
+  - Mandar cosas al Chromecast/TV, KDE Connect, compartir archivos en LAN.
+  - VMs con libvirt/virt-manager (forward en drop les quita internet).
+    VirtualBox en NAT normalmente no se afecta.
+  - Docker: necesita reglas extra.
+
+PROS: nadie de mi red ni de la VPN puede conectarse a mi sin permiso; si dejo
+un nc abierto por error, nadie mas lo ve; me protege de otros jugadores.
+CONTRAS: cuando algo "no conecta", acordarme de revisar el firewall
+(error muy comun en HTB: la shell no llega y era el firewall).
+
+
+===============================================================================
+8. CONFIGURACION FINAL (/etc/nftables.conf)
+===============================================================================
+
+#!/usr/bin/nft -f
+# vim:set ts=2 sw=2 et:
+
+# Firewall para BlackArch + Hack The Box
+# - Bloquea todo lo que entra, salvo respuestas a conexiones propias
+# - Permite todo lo que sale (instalar paquetes, navegar, escanear)
+# - Por la VPN (tun0) solo acepta conexiones de las maquinas objetivo de HTB
+
+destroy table inet filter
+table inet filter {
+  # Rangos de maquinas objetivo de HTB (revisa tu panel de HTB si cambian).
+  # Los jugadores (10.10.14.0/23, 10.10.16.0/20) NO estan aqui: quedan bloqueados.
+  set htb_targets {
+    type ipv4_addr
+    flags interval
+    elements = { 10.10.10.0/24, 10.10.11.0/24, 10.129.0.0/16 }
+  }
+
+  chain input {
+    type filter hook input priority filter
+    policy drop
+
+    ct state invalid drop comment "descartar paquetes invalidos"
+    ct state {established, related} accept comment "respuestas a conexiones propias"
+    iif lo accept comment "loopback (tu propia maquina)"
+
+    meta l4proto icmp limit rate 5/second accept comment "ping IPv4 (limitado)"
+    meta l4proto ipv6-icmp accept comment "ICMPv6 (necesario para IPv6)"
+
+    iifname "tun0" ip saddr @htb_targets accept comment "HTB: reverse shells, http.server, smb, etc."
+
+    # Para volver a permitir SSH entrante, descomenta:
+    # tcp dport ssh accept comment "servidor SSH"
+
+    pkttype host limit rate 5/second counter reject with icmpx type admin-prohibited
+    counter comment "paquetes bloqueados"
+  }
+
+  chain forward {
+    type filter hook forward priority filter
+    policy drop
+  }
+
+  chain output {
+    type filter hook output priority filter
+    policy accept
+  }
+}
+
+Cambios respecto al archivo original de Arch:
+  - Se quito "tcp dport ssh accept" (puerto 22 cerrado).
+  - Se agrego la regla de HTB por tun0.
+  - Se agrego el set "htb_targets": si cambian los rangos, solo edito esa lista.
+  - Ping limitado a 5 por segundo.
+  - Cadena output que deja salir todo.
+  - Comentarios en espanol en cada regla.
+
+Antes de aplicarla, la probe sin tocar el sistema:
+  nft -c -f nftables.conf        (-c = solo revisa la sintaxis)
+
+
+===============================================================================
+9. PASO A PASO: COMO LA APLIQUE
+===============================================================================
+
+Paso 1. Hacer copia de seguridad del archivo original:
+    sudo cp /etc/nftables.conf /etc/nftables.conf.backup
+
+Paso 2. Poner la configuracion nueva:
+    sudo cp nftables.conf /etc/nftables.conf
+
+Paso 3. Activar el firewall y que arranque solo al prender la PC:
+    sudo systemctl enable --now nftables
+
+Paso 4. Ver las reglas activas:
+    sudo nft list ruleset
+
+Paso 5. Comprobar que sigo teniendo internet:
+    ping -c 2 1.1.1.1
+    curl -I https://archlinux.org
+
+Nota: los comandos con sudo hay que ejecutarlos en una terminal normal,
+porque piden la contrasena.
+
+
+===============================================================================
+10. VERIFICACION (Y POR QUE SYSTEMCTL DICE "INACTIVE")
+===============================================================================
+
+Resultado:
+  systemctl is-enabled nftables -> enabled   (arranca solo al prender la PC)
+  systemctl is-active nftables  -> inactive  (ES NORMAL)
+  Internet: ping OK, HTTPS OK, DNS OK
+
+Por que "inactive" no es un error: el servicio de nftables es de tipo
+"oneshot". Solo ejecuta "nft -f /etc/nftables.conf", carga las reglas en el
+kernel y termina (status=0/SUCCESS). El programa ya termino, pero las reglas
+SE QUEDAN en el kernel, que es quien filtra. La prueba real es:
+    sudo nft list ruleset
+
+
+===============================================================================
+11. COMO LEER LA SALIDA DE "nft list ruleset"
+===============================================================================
+
+  table inet filter             -> la tabla (inet = IPv4 e IPv6)
+  set htb_targets               -> lista de rangos de maquinas de HTB
+  chain input ... policy drop   -> todo lo que entra se bloquea por defecto
+  established, related accept   -> entran las respuestas a lo que yo pido
+  iif "lo" accept               -> mi maquina puede hablar consigo misma
+  icmp limit rate 5/second      -> ping permitido pero limitado
+  iifname "tun0" ... accept     -> las maquinas de HTB pueden conectarse a mi
+  reject ... counter packets 1  -> ya bloqueo 1 paquete: SI esta filtrando
+  chain forward ... policy drop -> mi PC no reenvia trafico (no es router)
+  chain output ... accept       -> puedo salir a donde quiera
+
+Error comun: escribir "nft list releset" en vez de "ruleset" da
+"syntax error". Solo es un typo.
+
+
+===============================================================================
+12. COMANDOS UTILES
+===============================================================================
+
+  sudo nft list ruleset                  ver reglas activas
+  sudo nft -f /etc/nftables.conf         cargar reglas desde el archivo
+  sudo nft -c -f /etc/nftables.conf      revisar sintaxis sin aplicar
+  sudo systemctl enable --now nftables   activar y arrancar al iniciar
+  sudo systemctl restart nftables        recargar las reglas guardadas
+  sudo nft flush ruleset                 borrar TODAS las reglas
+  ss -tulnp                              ver que puertos estan escuchando
+  ip a show tun0                         ver mi IP en la VPN de HTB
+
+Abrir un puerto temporalmente (se pierde al reiniciar el servicio):
+  sudo nft add rule inet filter input tcp dport 8080 accept
+  sudo systemctl restart nftables        (volver a las reglas guardadas)
+
+Volver a permitir SSH: descomentar en /etc/nftables.conf la linea
+  # tcp dport ssh accept comment "servidor SSH"
+y luego: sudo systemctl restart nftables
+
+
+===============================================================================
+13. SI ALGO FALLA (POR EJEMPLO, ME QUEDO SIN INTERNET)
+===============================================================================
+
+  sudo nft flush ruleset                                 quita todo al instante
+  sudo cp /etc/nftables.conf.backup /etc/nftables.conf   vuelve al original
+
+
+===============================================================================
+14. OTRAS MEDIDAS DE SEGURIDAD
+===============================================================================
+
+  - Usar una maquina virtual (Kali o Parrot) para HTB, separada del sistema
+    principal. Es la proteccion mas importante.
+  - No exponer servicios que no necesito. Revisar ss -tulnp de vez en cuando.
+  - Mantener el sistema actualizado: sudo pacman -Syu
+  - No reutilizar contrasenas ni guardar cosas personales en la maquina
+    de hacking.
+  - No dejar nc -lvnp escuchando en 0.0.0.0 en redes publicas.
+
+
+===============================================================================
+15. DONDE SEGUIR APRENDIENDO
+===============================================================================
+
+No es tan avanzado: lo dificil no es el firewall, sino entender REDES.
+Sabiendo que es una IP, un puerto y una conexion TCP, las reglas se leen solas.
+
+Orden recomendado:
+  1. Redes basicas (lo mas importante)
+     - IP, subred (/24), puerto, TCP vs UDP, three-way handshake
+     - HTB Academy: "Introduction to Networking", "Linux Fundamentals"
+     - TryHackMe: ruta "Pre Security"
+  2. Firewalls en Linux (nftables)
+     - Arch Wiki -> nftables (wiki.archlinux.org)
+     - wiki.nftables.org (documentacion oficial)
+     - man nft
+  3. Firewalls desde el lado del atacante
+     - HTB Academy: "Network Enumeration with Nmap"
+       (puertos filtered y evasion de firewalls)
+
+Practica: leer mi /etc/nftables.conf regla por regla y ver como suben los
+contadores con "sudo nft list ruleset".
+
+===============================================================================
